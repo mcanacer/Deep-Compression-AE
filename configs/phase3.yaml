@@ -1,0 +1,60 @@
+dataset_params:
+  dataset: 'imagenet'
+  img_size: 256
+  batch_size: 512
+  num_workers: 12
+  prefetch_factor: 4
+  data_path: /dev/shm/imagenet/train
+
+model:
+  optim_params:
+    learning_rate: 5.4e-5
+    b1: 0.5
+    b2: 0.9
+    weight_decay: 0.0
+    eps: 1e-8
+  target: vqmodel.ConvVQModel
+  seed: 61
+  params:
+    in_channels: 3
+    latent_channels: 32
+    encoder_block_types: (ResBlock, ResBlock, ResBlock, EfficientViTBlock, EfficientViTBlock,
+      EfficientViTBlock)
+    decoder_block_types: ("ResBlock", "ResBlock", "ResBlock", "EfficientViTBlock", "EfficientViTBlock",
+      EfficientViTBlock)
+    encoder_block_out_channels: (128, 256, 512, 512, 1024, 1024)
+    decoder_block_out_channels: (128, 256, 512, 512, 1024, 1024)
+    encoder_layers_per_block: (0, 4, 8, 2, 2, 2)
+    decoder_layers_per_block: (0, 5, 10, 2, 2, 2)
+    encoder_qkv_multiscales: ((), (), (), (), (), ())
+    decoder_qkv_multiscales: ((), (), (), (), (), ())
+    decoder_norm_types: (rms, rms, rms, rms, rms, rms)
+    decoder_act_fns: (relu, relu, relu, silu, silu, silu)
+  checkpoint_path: /home/muhammetcan/checkpoints/dcae_phase3.pkl
+  reconstruction_weight: 1.0
+  generator_weight: 0.1
+  epochs: 250
+  ema_decay: 0.999
+
+discriminator:
+  optim_params:
+    learning_rate: 1e-4
+    b1: 0.9
+    b2: 0.999
+    weight_decay: 1e-4
+    eps: 1e-8
+  target: discriminator.discriminator
+  params:
+    filters: 128
+    channel_multipliers: [1, 2, 4, 8]
+    blur_kernel_size: 4
+  discriminator_weight: 0.02
+  disc_start: 10000000
+
+perceptual:
+  target: perceptual.PerceptualLoss
+  perceptual_weight: 0.1
+
+wandb:
+  project: 'Deep Compress AE'
+  name: 'imagenet'
