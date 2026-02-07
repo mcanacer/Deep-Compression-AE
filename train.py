@@ -6,7 +6,7 @@ import os
 import jax
 import jax.numpy as jnp
 import optax
-from flax import serialization
+from flax import serialization, traverse_util
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import ImageFolder
@@ -60,6 +60,28 @@ def create_optimizer(learning_rate, weight_decay, beta1=0.9, beta2=0.999):
     )
 
 
+def create_phase2_optimizer(params, learning_rate=1.6e-5):
+    partition_optimizers = {
+        'trainable': optax.adamw(learning_rate=learning_rate, b1=0.9, b2=0.999, weight_decay=0.001),
+        'frozen': optax.set_to_zero()
+    }
+
+    def map_fn(path, v):
+        path_str = '/'.join(path)
+
+        if 'Encoder_0/SanaMultiscaleLinearAttention_5' in path_str or 'Encoder_0/GLUMBConv_5' in path_str or 'Encoder_0/Conv_0' in path_str:
+            return 'trainable'
+
+        if 'Decoder_0/Conv_0' in path_str or 'Decoder_0/DCUpBlock2d_0' in path_str or 'norm' in path_str:
+            return 'trainable'
+
+        return 'frozen'
+
+    param_partitions = traverse_util.path_aware_map(map_fn, params)
+
+    return optax.multi_transform(partition_optimizers, param_partitions)
+
+
 def make_generator_update_fn(
         *,
         dcae_apply_fn,
@@ -85,18 +107,27 @@ def make_generator_update_fn(
             global_step
     ):
         def loss_fn(dcae_params, disc_params):
-            recontructed_images = dcae_apply_fn(dcae_params, images)
+            reconstructed_images = dcae_apply_fn(dcae_params, images)
 
-            reconstruction_loss = jnp.mean(jnp.abs(recontructed_images - images))
+            reconstruction_loss = jnp.mean(
+                jnp.abs(
+                    reconstructed_images.astype(jnp.float32) -
+                    images.astype(jnp.float32)
+                )
+            )
             reconstruction_loss *= reconstruction_weight
 
-            perceptual_loss = perceptual_apply_fn(perceptual_params, recontructed_images, images)
+            perceptual_loss = perceptual_apply_fn(
+                perceptual_params,
+                reconstructed_images.astype(jnp.float32),
+                images.astype(jnp.float32)
+            )
 
             discriminator_factor = adopt_weight(global_step, disc_start)
             d_weight = discriminator_weight
 
-            logits_real = disc_apply_fn(disc_params, images)
-            logits_fake = disc_apply_fn(disc_params, recontructed_images)
+            logits_real = disc_apply_fn(disc_params, images).astype(jnp.float32)
+            logits_fake = disc_apply_fn(disc_params, reconstructed_images).astype(jnp.float32)
 
             generator_loss = -jnp.mean(logits_fake)
 
@@ -115,7 +146,7 @@ def make_generator_update_fn(
 
             loss_dict = dict(
                 generator_loss=generator_loss,
-                recontructed_images=recontructed_images,
+                reconstructed_images=reconstructed_images.astype(jnp.float32),
                 reconstruction_loss=reconstruction_loss,
                 perceptual_loss=(perceptual_weight * perceptual_loss),
                 weighted_gan_loss=(d_weight * discriminator_factor * generator_loss),
@@ -130,8 +161,8 @@ def make_generator_update_fn(
         (g_loss, d_loss), func_vjp, (loss_dict) = jax.vjp(
             loss_fn, dcae_params, disc_params, has_aux=True)
 
-        grad_g, _ = func_vjp(1., 0.)
-        _, grad_d = func_vjp(0., 1.)
+        grad_g, _ = func_vjp(jnp.array(1., dtype=jnp.float32), jnp.array(0., dtype=jnp.float32))
+        _, grad_d = func_vjp(jnp.array(0., dtype=jnp.float32), jnp.array(1., dtype=jnp.float32))
 
         grad_g = jax.lax.pmean(grad_g, axis_name="batch")
         grad_d = jax.lax.pmean(grad_d, axis_name="batch")
@@ -308,7 +339,6 @@ def main(config_path):
                 global_step_repl
             )
 
-            reconstructed_images = unreplicate(loss_dict['recontructed_images'])
             global_step = int(unreplicate(global_step_repl))
 
             if global_step % 1000 == 0:
@@ -316,7 +346,7 @@ def main(config_path):
                 import matplotlib.pyplot as plt
 
                 real_img = unshard(images)
-                recon_img = unshard(reconstructed_images)
+                recon_img = unshard(loss_dict['reconstructed_images'])
 
                 def process_vis(img):
                     mean = jnp.expand_dims(jnp.array([0.485, 0.456, 0.406]), axis=(0, 1, 2))

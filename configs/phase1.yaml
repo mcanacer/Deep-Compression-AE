@@ -2,7 +2,7 @@ dataset_params:
   dataset: 'imagenet'
   img_size: 256
   batch_size: 512
-  num_workers: 12
+  num_workers: 16
   prefetch_factor: 4
   data_path: /dev/shm/imagenet/train
 
@@ -13,7 +13,6 @@ model:
     b2: 0.999
     weight_decay: 0.1
     eps: 1e-8
-  target: vqmodel.ConvVQModel
   seed: 61
   params:
     in_channels: 3

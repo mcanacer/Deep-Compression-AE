@@ -22,24 +22,27 @@ class RMSNorm(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-        x = x * jax.lax.rsqrt(variance + self.epsilon)
+        x_f32 = x.astype(jnp.float32)
+
+        variance = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
+        x_norm = x_f32 * jax.lax.rsqrt(variance + self.epsilon)
 
         if self.use_scale:
-            scale = self.param('scale', nn.initializers.ones, (x.shape[-1],))
-            x = x * scale
+            scale = self.param('scale', nn.initializers.ones, (x.shape[-1],), jnp.float32)
+            x_norm = x_norm * scale
 
         if self.use_bias:
-            bias = self.param('bias', nn.initializers.zeros, (x.shape[-1],))
-            x = x + bias
+            bias = self.param('bias', nn.initializers.zeros, (x.shape[-1],), jnp.float32)
+            x_norm = x_norm + bias
 
-        return x
+        return x_norm.astype(self.dtype)
 
 
 class DCDownBlock2d(nn.Module):
     out_channels: int
     factor: int =  2
     shortcut: bool = False
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -49,6 +52,8 @@ class DCDownBlock2d(nn.Module):
         x = nn.Conv(
             out_channels,
             kernel_size=(3, 3),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
         )(hidden_states)
 
         # Pixel Unshuffle
@@ -69,6 +74,7 @@ class DCUpBlock2d(nn.Module):
     out_channels: int
     shortcut: bool = True
     factor: int = 2
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -76,7 +82,12 @@ class DCUpBlock2d(nn.Module):
         out_ratio = self.factor ** 2
         conv_out_channels = self.out_channels * out_ratio
 
-        x = nn.Conv(conv_out_channels, kernel_size=(3, 3))(hidden_states)
+        x = nn.Conv(
+            conv_out_channels,
+            kernel_size=(3, 3),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(hidden_states)
 
         # Pixel shuffle
         x = rearrange(x, 'n h w (c b1 b2) -> n (h b1) (w b2) c',b1=self.factor, b2=self.factor)
@@ -97,6 +108,7 @@ class DCUpBlock2d(nn.Module):
 class SanaMultiscaleAttentionProjection(nn.Module):
     num_attention_heads: int
     kernel_size: int
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x):
@@ -105,7 +117,9 @@ class SanaMultiscaleAttentionProjection(nn.Module):
             kernel_size=(self.kernel_size, self.kernel_size),
             feature_group_count=x.shape[-1],
             use_bias=False,
-            padding="SAME"
+            padding="SAME",
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
         )(x)
 
         x = nn.Conv(
@@ -113,6 +127,8 @@ class SanaMultiscaleAttentionProjection(nn.Module):
             kernel_size=(1, 1),
             feature_group_count=3 * self.num_attention_heads,
             use_bias=False,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
         )(x)
 
         return x
@@ -126,8 +142,9 @@ class SanaMultiscaleLinearAttention(nn.Module):
     mult: float = 1.0
     norm_type: str = "rms"
     kernel_sizes: Tuple[int, ...] = (5,)
-    eps: float = 1e-15
+    eps: float = 1e-8
     residual_connection: bool = False
+    dtype: jnp.dtype = jnp.bfloat16
 
     def apply_linear_attention(self, query, key, value):
         padding = jnp.ones((value.shape[0], value.shape[1], 1, value.shape[3]), dtype=value.dtype)
@@ -165,9 +182,12 @@ class SanaMultiscaleLinearAttention(nn.Module):
         eff_head_dim = self.attention_head_dim * num_scales
         inner_dim = n_heads * self.attention_head_dim
 
-        query = nn.Dense(inner_dim, use_bias=False, name="to_q")(hidden_states)
-        key = nn.Dense(inner_dim, use_bias=False, name="to_k")(hidden_states)
-        value = nn.Dense(inner_dim, use_bias=False, name="to_v")(hidden_states)
+        query = nn.Dense(inner_dim, use_bias=False, name="to_q",
+                         dtype=self.dtype, param_dtype=jnp.float32)(hidden_states)
+        key = nn.Dense(inner_dim, use_bias=False, name="to_k",
+                       dtype=self.dtype, param_dtype=jnp.float32)(hidden_states)
+        value = nn.Dense(inner_dim, use_bias=False, name="to_v",
+                         dtype=self.dtype, param_dtype=jnp.float32)(hidden_states)
 
         qkv = jnp.concatenate([query, key, value], axis=-1)
 
@@ -176,7 +196,8 @@ class SanaMultiscaleLinearAttention(nn.Module):
             proj = SanaMultiscaleAttentionProjection(
                 num_attention_heads=n_heads,
                 kernel_size=k_size,
-                name=f"ms_proj_{i}"
+                name=f"ms_proj_{i}",
+                dtype=self.dtype,
             )(qkv)
             multi_scale_qkv.append(proj)
 
@@ -199,12 +220,13 @@ class SanaMultiscaleLinearAttention(nn.Module):
         attn_out = jnp.transpose(attn_out, (0, 3, 1, 2))
         attn_out = attn_out.reshape(N, H, W, -1)
 
-        x = nn.Dense(self.out_channels, use_bias=False, name="to_out")(attn_out)
+        x = nn.Dense(self.out_channels, use_bias=False, name="to_out",
+                     dtype=self.dtype, param_dtype=jnp.float32)(attn_out)
 
         if self.norm_type == "rms":
             x = RMSNorm()(x)
         elif self.norm_type == "layer":
-            x = nn.LayerNorm()(x)
+            x = nn.LayerNorm()(x.astype(jnp.float32))
 
         if residual is not None:
             x = x + residual
@@ -217,25 +239,39 @@ class GLUMBConv(nn.Module):
     norm_type: str = "rms"
     expansion: int = 4
     residual_connection: bool = True
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x):
         residual = x if self.residual_connection else None
         hidden_channels = int(x.shape[-1] * self.expansion)
 
-        x = nn.Conv(hidden_channels * 2, kernel_size=(1, 1))(x)
+        x = nn.Conv(
+            hidden_channels * 2,
+            kernel_size=(1, 1),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(x)
         x = get_activation('silu')(x)
 
         x = nn.Conv(
             hidden_channels * 2,
             kernel_size=(3, 3),
-            feature_group_count=hidden_channels * 2
+            feature_group_count=hidden_channels * 2,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
         )(x)
 
         hidden_states, gate = jnp.split(x, 2, axis=-1)
         hidden_states = hidden_states * get_activation('silu')(gate)
 
-        x = nn.Conv(self.out_channels, kernel_size=(1, 1), use_bias=False)(hidden_states)
+        x = nn.Conv(
+            self.out_channels,
+            kernel_size=(1, 1),
+            use_bias=False,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(hidden_states)
 
         if self.norm_type == "rms":
             x = RMSNorm()(x)
@@ -248,16 +284,24 @@ class ResBlock(nn.Module):
     out_channels: int
     act_fn: str
     norm_type: str = 'rms'
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x):
         residual = x
-        x = nn.Conv(x.shape[-1], kernel_size=(3, 3))(x)
+        x = nn.Conv(
+            x.shape[-1],
+            kernel_size=(3, 3),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(x)
         x = get_activation(self.act_fn)(x)
         x = nn.Conv(
             self.out_channels,
             kernel_size=(3, 3),
             use_bias=False,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
         )(x)
 
         if self.norm_type == 'rms':
@@ -277,6 +321,7 @@ class Encoder(nn.Module):
     norm_type: str = "rms"
     act_fn: str = "silu"
     out_shortcut: bool = True
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x):
@@ -284,17 +329,22 @@ class Encoder(nn.Module):
         b_types = (self.block_type,) * num_blocks if isinstance(self.block_type, str) else self.block_type
 
         if self.layers_per_block[0] > 0:
-            x = nn.Conv(features=self.block_out_channels[0], kernel_size=(3, 3))(x)
+            x = nn.Conv(
+                features=self.block_out_channels[0],
+                kernel_size=(3, 3),
+                dtype=self.dtype,
+                param_dtype=jnp.float32,
+            )(x)
         else:
             x = DCDownBlock2d(
                 out_channels=self.block_out_channels[0] if self.layers_per_block[0] > 0 else self.block_out_channels[1],
-                shortcut=False
+                shortcut=False, dtype=self.dtype,
             )(x)
 
         for i, (out_ch, num_layers) in enumerate(zip(self.block_out_channels, self.layers_per_block)):
             for j in range(num_layers):
                 if b_types[i] == "ResBlock":
-                    x = ResBlock(out_channels=out_ch, act_fn=self.act_fn, norm_type=self.norm_type)(x)
+                    x = ResBlock(out_channels=out_ch, act_fn=self.act_fn, norm_type=self.norm_type, dtype=self.dtype)(x)
                 elif b_types[i] == "EfficientViTBlock":
                     x = SanaMultiscaleLinearAttention(
                         in_channels=out_ch,
@@ -302,23 +352,27 @@ class Encoder(nn.Module):
                         attention_head_dim=self.attention_head_dim,
                         kernel_sizes=self.qkv_multiscales[i],
                         norm_type=self.norm_type,
-                        residual_connection=True
+                        residual_connection=True,
+                        dtype=self.dtype,
                     )(x)
                     x = GLUMBConv(
                         out_channels=out_ch,
                         norm_type=self.norm_type,
-                        residual_connection=True
+                        residual_connection=True,
+                        dtype=self.dtype,
                     )(x)
 
             if i < num_blocks - 1 and num_layers > 0:
-                x = DCDownBlock2d(out_channels=self.block_out_channels[i + 1], shortcut=True)(x)
+                x = DCDownBlock2d(out_channels=self.block_out_channels[i + 1], shortcut=True, dtype=self.dtype)(x)
 
         if self.out_shortcut:
             group_size = x.shape[-1] // self.latent_channels
             shortcut = x.reshape((*x.shape[:-1], self.latent_channels, group_size)).mean(axis=-1)
-            x = nn.Conv(features=self.latent_channels, kernel_size=(3, 3))(x) + shortcut
+            x = nn.Conv(
+                features=self.latent_channels,
+                kernel_size=(3, 3), dtype=self.dtype, param_dtype=jnp.float32)(x) + shortcut
         else:
-            x = nn.Conv(features=self.latent_channels, kernel_size=(3, 3))(x)
+            x = nn.Conv(features=self.latent_channels, kernel_size=(3, 3), dtype=self.dtype, param_dtype=jnp.float32)(x)
 
         return x
 
@@ -335,6 +389,7 @@ class Decoder(nn.Module):
     act_fn: Union[str, Tuple[str]] = "silu",
     in_shortcut: bool = True
     conv_act_fn: str = "relu"
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, z):
@@ -346,37 +401,41 @@ class Decoder(nn.Module):
         if self.in_shortcut:
             repeats = self.block_out_channels[-1] // self.latent_channels
             shortcut = jnp.repeat(z, repeats, axis=-1)
-            x = nn.Conv(features=self.block_out_channels[-1], kernel_size=(3, 3))(z) + shortcut
+            x = nn.Conv(
+                features=self.block_out_channels[-1],
+                kernel_size=(3, 3), dtype=self.dtype, param_dtype=jnp.float32)(z) + shortcut
         else:
-            x = nn.Conv(features=self.block_out_channels[-1], kernel_size=(3, 3))(z)
+            x = nn.Conv(
+                features=self.block_out_channels[-1], kernel_size=(3, 3), dtype=self.dtype, param_dtype=jnp.float32)(z)
 
         for i in range(num_blocks - 1, -1, -1):
             out_ch = self.block_out_channels[i]
             num_layers = self.layers_per_block[i]
 
             if i < num_blocks - 1 and num_layers > 0:
-                x = DCUpBlock2d(out_channels=out_ch, shortcut=True)(x)
+                x = DCUpBlock2d(out_channels=out_ch, shortcut=True, dtype=self.dtype)(x)
 
             for j in range(num_layers):
                 if b_types[i] == "ResBlock":
-                    x = ResBlock(out_channels=out_ch, norm_type=norm_types[i], act_fn=act_fn[i])(x)
+                    x = ResBlock(out_channels=out_ch, norm_type=norm_types[i], act_fn=act_fn[i], dtype=self.dtype)(x)
                 elif b_types[i] == "EfficientViTBlock":
                     x = SanaMultiscaleLinearAttention(
                         in_channels=out_ch,
                         out_channels=out_ch,
                         attention_head_dim=self.attention_head_dim,
                         kernel_sizes=self.qkv_multiscales[i],
-                        residual_connection=True
+                        residual_connection=True,
+                        dtype=self.dtype,
                     )(x)
-                    x = GLUMBConv(out_channels=out_ch, residual_connection=True)(x)
+                    x = GLUMBConv(out_channels=out_ch, residual_connection=True, dtype=self.dtype)(x)
 
         x = RMSNorm()(x)
         x = get_activation(self.conv_act_fn)(x)
 
         if self.layers_per_block[0] > 0:
-            x = nn.Conv(features=self.in_channels, kernel_size=(3, 3))(x)
+            x = nn.Conv(features=self.in_channels, kernel_size=(3, 3), dtype=self.dtype, param_dtype=jnp.float32)(x)
         else:
-            x = DCUpBlock2d(out_channels=self.in_channels, shortcut=False)(x)
+            x = DCUpBlock2d(out_channels=self.in_channels, shortcut=False, dtype=self.dtype)(x)
 
         return x
 
@@ -399,6 +458,7 @@ class AutoencoderDC(nn.Module):
     decoder_in_shortcut: bool = True
     decoder_conv_act_fn: str = "relu"
     scaling_factor: float = 1.0
+    dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x):
@@ -409,7 +469,8 @@ class AutoencoderDC(nn.Module):
             layers_per_block=self.encoder_layers_per_block,
             block_type=self.encoder_block_types,
             attention_head_dim=self.attention_head_dim,
-            qkv_multiscales=self.encoder_qkv_multiscales
+            qkv_multiscales=self.encoder_qkv_multiscales,
+            dtype=self.dtype,
         )(x)
 
         recon = Decoder(
@@ -424,6 +485,7 @@ class AutoencoderDC(nn.Module):
             in_shortcut=self.decoder_in_shortcut,
             qkv_multiscales=self.decoder_qkv_multiscales,
             conv_act_fn=self.decoder_conv_act_fn,
+            dtype=self.dtype,
         )(z)
 
         return recon
@@ -436,7 +498,8 @@ class AutoencoderDC(nn.Module):
             layers_per_block=self.encoder_layers_per_block,
             block_type=self.encoder_block_types,
             attention_head_dim=self.attention_head_dim,
-            qkv_multiscales=self.encoder_qkv_multiscales
+            qkv_multiscales=self.encoder_qkv_multiscales,
+            dtype=self.dtype,
         )(x)
         return z
 
@@ -449,7 +512,8 @@ class AutoencoderDC(nn.Module):
             layers_per_block=self.decoder_layers_per_block,
             block_type=self.decoder_block_types,
             attention_head_dim=self.attention_head_dim,
-            qkv_multiscales=self.decoder_qkv_multiscales
+            qkv_multiscales=self.decoder_qkv_multiscales,
+            dtype=self.dtype,
         )(z)
 
 
@@ -467,7 +531,7 @@ if __name__ == "__main__":
         "decoder_layers_per_block": (0, 5, 10, 2, 2, 2),
         "encoder_qkv_multiscales": ((), (), (), (), (), ()),
         "decoder_qkv_multiscales": ((), (), (), (), (), ()),
-        "decoder_norm_types": ("batch", "batch", "batch", "rms", "rms", "rms"),
+        "decoder_norm_types": ("rms", "rms", "rms", "rms", "rms", "rms"),
         "decoder_act_fns": ("relu", "relu", "relu", "silu", "silu", "silu")
     }
 
